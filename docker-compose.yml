@@ -1,0 +1,20 @@
+services:
+  xmcp:
+    build: .
+    image: xmcp:local
+    container_name: xmcp
+    restart: unless-stopped
+    # Bind to loopback only — MCP clients on this host reach it at 127.0.0.1:8000
+    # as before. This keeps the server off the LAN/internet.
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
