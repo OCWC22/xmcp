@@ -6,6 +6,7 @@ __pycache__/
 .gitignore
 .env
 .env.*
+data/
 *.md
 !README.md
 docker-compose.yml

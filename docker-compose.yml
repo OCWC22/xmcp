@@ -13,6 +13,10 @@ services:
     environment:
       MCP_HOST: 0.0.0.0
       MCP_PORT: 8000
+    volumes:
+      # Persist rotated OAuth2 refresh tokens across container restarts.
+      # Seeded by tools/oauth2_bootstrap.py (run on host before first start).
+      - ./data:/app/data
     logging:
       driver: json-file
       options:
