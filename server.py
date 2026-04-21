@@ -56,6 +56,106 @@ def should_join_query_param(param: dict) -> bool:
     return param.get("explode") is False
 
 
+def _truncate_text(value: str | None, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def _slim_schema_tree(schema: dict) -> None:
+    """Walk a JSON Schema fragment and drop bulky keys that Claude Desktop
+    doesn't need to advertise a tool. Keeps type/description/required."""
+    if not isinstance(schema, dict):
+        return
+    for heavy in ("example", "examples", "externalDocs", "x-twitter-enum-descriptions"):
+        schema.pop(heavy, None)
+    desc = schema.get("description")
+    trimmed = _truncate_text(desc, 140)
+    if trimmed is not None:
+        schema["description"] = trimmed
+    elif "description" in schema:
+        schema.pop("description", None)
+    for inner in ("properties", "patternProperties"):
+        child = schema.get(inner)
+        if isinstance(child, dict):
+            for v in child.values():
+                _slim_schema_tree(v)
+    for inner in ("items", "additionalProperties", "not"):
+        child = schema.get(inner)
+        if isinstance(child, dict):
+            _slim_schema_tree(child)
+    for inner in ("allOf", "anyOf", "oneOf"):
+        arr = schema.get(inner)
+        if isinstance(arr, list):
+            for v in arr:
+                _slim_schema_tree(v)
+
+
+def _slim_parameter(param: dict, comma_params: set[str]) -> None:
+    """Collapse X's giant field-selector enums into plain comma-separated
+    strings. These params accept comma-joined values at the API anyway, so
+    no capability is lost — just ~95% of the schema bytes."""
+    if not isinstance(param, dict) or "$ref" in param:
+        return
+    name = param.get("name")
+    schema = param.get("schema")
+    if not isinstance(schema, dict):
+        return
+
+    is_comma_array = (
+        schema.get("type") == "array" and param.get("explode") is False
+    ) or name in comma_params
+
+    if is_comma_array:
+        items = schema.get("items") if isinstance(schema.get("items"), dict) else {}
+        enum_vals = items.get("enum") or []
+        sample = ",".join(list(enum_vals)[:4]) if enum_vals else ""
+        hint_parts = ["Comma-separated list"]
+        if sample:
+            hint_parts.append(f"(e.g. {sample})")
+        param["schema"] = {"type": "string", "description": " ".join(hint_parts)}
+    else:
+        _slim_schema_tree(schema)
+
+    if "description" in param:
+        param["description"] = _truncate_text(param["description"], 140)
+        if not param["description"]:
+            param.pop("description", None)
+
+
+def slim_openapi_spec(spec: dict, comma_params: set[str]) -> None:
+    """Trim bloat from X's OpenAPI so FastMCP emits compact MCP tool schemas.
+    Mutates spec in place. Preserves operation IDs, parameters, and the
+    query-param semantics used by the HTTP client."""
+    for param in spec.get("components", {}).get("parameters", {}).values():
+        _slim_parameter(param, comma_params)
+
+    schemas = spec.get("components", {}).get("schemas", {})
+    for schema in schemas.values():
+        _slim_schema_tree(schema)
+
+    for path, item in spec.get("paths", {}).items():
+        if not isinstance(item, dict):
+            continue
+        for method, op in item.items():
+            if method.lower() not in HTTP_METHODS or not isinstance(op, dict):
+                continue
+            for p in op.get("parameters", []) or []:
+                _slim_parameter(p, comma_params)
+            if "summary" in op:
+                op["summary"] = _truncate_text(op["summary"], 140)
+            if "description" in op:
+                op["description"] = _truncate_text(op["description"], 240)
+            op.pop("externalDocs", None)
+            body = op.get("requestBody")
+            if isinstance(body, dict):
+                for content in (body.get("content") or {}).values():
+                    if isinstance(content, dict) and isinstance(content.get("schema"), dict):
+                        _slim_schema_tree(content["schema"])
+
+
 def collect_comma_params(spec: dict) -> set[str]:
     comma_params: set[str] = set()
     components = spec.get("components", {}).get("parameters", {})
@@ -307,7 +407,13 @@ def build_oauth1_client() -> OAuth1Client:
         raise RuntimeError(
             "Missing X_OAUTH_CONSUMER_KEY or X_OAUTH_CONSUMER_SECRET for OAuth1 signing."
         )
-    access_token, access_secret = run_oauth1_flow()
+    env_access_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
+    env_access_secret = os.getenv("X_OAUTH_ACCESS_TOKEN_SECRET", "").strip()
+    if env_access_token and env_access_secret:
+        access_token, access_secret = env_access_token, env_access_secret
+        LOGGER.info("Using OAuth1 access tokens from env; browser consent flow skipped.")
+    else:
+        access_token, access_secret = run_oauth1_flow()
     if is_truthy(os.getenv("X_OAUTH_PRINT_TOKENS", "0")):
         print("OAuth1 access token:", access_token)
         print("OAuth1 access token secret:", access_secret)
@@ -353,6 +459,8 @@ def create_mcp() -> FastMCP:
     spec = load_openapi_spec()
     filtered_spec = filter_openapi_spec(spec)
     comma_params = collect_comma_params(filtered_spec)
+    if is_truthy(os.getenv("X_API_SLIM_SCHEMAS", "1")):
+        slim_openapi_spec(filtered_spec, comma_params)
     print_tool_list(filtered_spec)
 
     async def normalize_query_params(request: httpx.Request) -> None:
@@ -444,11 +552,34 @@ def create_mcp() -> FastMCP:
             "response": [log_response],
         },
     )
-    return FastMCP.from_openapi(
+    mcp = FastMCP.from_openapi(
         openapi_spec=filtered_spec,
         client=client,
         name="X API MCP",
     )
+    if is_truthy(os.getenv("X_API_DROP_OUTPUT_SCHEMA", "1")):
+        strip_output_schemas(mcp)
+    return mcp
+
+
+def strip_output_schemas(mcp: FastMCP) -> None:
+    """Drop output_schema on every OpenAPI-derived tool. FastMCP generates it
+    from X's response shape (~67KB per tool), which blows past Claude Desktop's
+    tools/list size limit. outputSchema is optional in the MCP spec; invocation
+    works identically without it. mcp.list_tools() returns fresh copies, so we
+    mutate tools on each sub-provider's `_tools` dict directly."""
+    count = 0
+    for provider in getattr(mcp, "providers", []) or []:
+        stored = getattr(provider, "_tools", None)
+        if not isinstance(stored, dict):
+            continue
+        for tool in stored.values():
+            try:
+                tool.output_schema = None
+                count += 1
+            except Exception:
+                pass
+    LOGGER.info("Stripped output_schema on %d tools", count)
 
 
 def main() -> None:
